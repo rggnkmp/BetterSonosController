@@ -26,7 +26,7 @@ rsync -a --delete \
   --exclude '*.pyc' \
   "$PROJECT/" "$DEPLOY/"
 
-chmod +x "$RUNNER" "$DEPLOY/local-scripts/setup.sh"
+chmod +x "$RUNNER" "$DEPLOY/install.sh" "$DEPLOY/local-scripts/setup.sh"
 
 echo "→ Python venv in $DEPLOY …"
 if [[ ! -x "$DEPLOY/.venv/bin/python3" ]]; then
