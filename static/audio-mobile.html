@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#0f1419">
+  <title>Sonos — Homee</title>
+  <link rel="stylesheet" href="/static/audio-mobile.css">
+</head>
+<body>
+  <header class="m-audio-header">
+    <a href="/audio" class="m-audio-back" aria-label="Zum Dashboard">←</a>
+    <div class="m-audio-header-text">
+      <h1>Sonos</h1>
+      <p id="m-audio-meta">Lade …</p>
+    </div>
+    <button type="button" id="m-audio-refresh" class="m-audio-icon-btn" aria-label="Aktualisieren"></button>
+  </header>
+
+  <main class="m-audio-main">
+    <div id="m-audio-error" class="m-audio-error hidden" role="alert"></div>
+
+    <section id="m-audio-empty" class="m-audio-empty hidden">
+      <p>Keine Wiedergabe</p>
+    </section>
+
+    <section id="m-audio-active" class="m-audio-active-box hidden">
+      <div class="m-audio-cover-wrap">
+        <img id="m-audio-cover" class="m-audio-cover" alt="" decoding="async">
+        <div id="m-audio-cover-ph" class="m-audio-cover m-audio-cover-ph">♪</div>
+      </div>
+      <p id="m-audio-device" class="m-audio-device"></p>
+      <h2 id="m-audio-title" class="m-audio-title"></h2>
+      <p id="m-audio-artist" class="m-audio-artist"></p>
+      <div class="m-audio-timeline">
+        <input type="range" id="m-audio-scrub" min="0" max="0" value="0" aria-label="Wiedergabeposition">
+        <div class="m-audio-times">
+          <span id="m-audio-pos">0:00</span>
+          <span id="m-audio-dur">0:00</span>
+        </div>
+      </div>
+      <div class="m-audio-transport">
+        <button type="button" id="m-audio-prev" class="m-audio-transport-btn" aria-label="Zurück"></button>
+        <button type="button" id="m-audio-toggle" class="m-audio-transport-btn m-audio-play" aria-label="Wiedergabe"></button>
+        <button type="button" id="m-audio-next" class="m-audio-transport-btn" aria-label="Weiter"></button>
+      </div>
+      <div id="m-audio-solo-vol" class="m-audio-volume">
+        <button type="button" id="m-audio-mute" class="m-audio-icon-btn" aria-label="Stumm"></button>
+        <input type="range" id="m-audio-vol" min="0" max="100" value="0" aria-label="Lautstärke">
+        <span id="m-audio-vol-label" class="m-audio-vol-label">0%</span>
+      </div>
+      <ul id="m-audio-active-members" class="m-audio-active-members hidden"></ul>
+    </section>
+
+    <hr id="m-audio-divider" class="m-audio-divider hidden">
+
+    <div id="m-audio-others" class="m-audio-others hidden" data-drop-action="unjoin"></div>
+  </main>
+
+  <footer class="m-audio-footer">
+    <a href="/help">Help</a>
+  </footer>
+
+  <div id="m-audio-drag-ghost" class="m-audio-drag-ghost hidden" aria-hidden="true"></div>
+
+  <script src="/static/audio-mobile.js"></script>
+</body>
+</html>
