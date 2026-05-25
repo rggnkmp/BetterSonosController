@@ -702,10 +702,7 @@ body.m-audio-dragging {
     max-height: calc(100dvh - 40px - var(--safe-top) - var(--safe-bottom));
     overflow-y: auto;
     overscroll-behavior: contain;
-    border: 1px solid var(--border);
-    border-radius: 14px;
-    background: var(--panel);
-    padding: 10px 12px;
+    padding: 0;
   }
 
   .m-audio-devices-col:only-child {
