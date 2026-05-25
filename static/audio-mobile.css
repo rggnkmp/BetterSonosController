@@ -112,6 +112,24 @@ body[data-standalone="1"] .m-audio-main {
   margin: 0 auto;
 }
 
+.m-audio-layout {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.m-audio-play-col {
+  min-width: 0;
+}
+
+.m-audio-devices-col {
+  min-width: 0;
+}
+
+.m-audio-devices-col.hidden {
+  display: none !important;
+}
+
 .m-audio-error {
   padding: 12px 14px;
   border-radius: 12px;
@@ -276,15 +294,18 @@ body[data-standalone="1"] .m-audio-main {
 
 .m-audio-active-members {
   list-style: none;
-  margin: 12px 0 0;
-  padding: 8px 0 0;
+  margin: 0;
+  padding: 0;
   width: 100%;
-  border-top: 1px solid var(--border);
   --m-col-name: minmax(0, 1fr);
   --m-col-vol: 5.5rem;
   --m-col-mute: 2.75rem;
   --m-col-actions: minmax(0, 1fr);
   --m-col-takeover: 34px;
+}
+
+.m-audio-active-members:not(.hidden) {
+  margin-bottom: 4px;
 }
 
 .m-audio-member-row {
@@ -635,4 +656,114 @@ body.m-audio-dragging {
 
 .m-audio-help section a {
   color: var(--accent);
+}
+
+/* ── Landscape: play left, groups/devices right ── */
+
+@media (orientation: landscape), (min-aspect-ratio: 1/1) {
+  body[data-standalone="1"] .m-audio-main {
+    padding-top: calc(8px + var(--safe-top));
+    padding-left: calc(12px + env(safe-area-inset-left, 0px));
+    padding-right: calc(12px + env(safe-area-inset-right, 0px));
+  }
+
+  .m-audio-main {
+    max-width: none;
+    padding-bottom: 8px;
+  }
+
+  .m-audio-footer {
+    max-width: none;
+  }
+
+  .m-audio-layout {
+    display: grid;
+    grid-template-columns: minmax(0, 1.05fr) minmax(0, 0.95fr);
+    gap: 14px;
+    align-items: stretch;
+    min-height: calc(100dvh - 48px - var(--safe-top) - var(--safe-bottom));
+  }
+
+  body[data-standalone="1"] .m-audio-layout {
+    min-height: calc(100dvh - 36px - var(--safe-top) - var(--safe-bottom));
+  }
+
+  .m-audio-play-col {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    min-height: 0;
+  }
+
+  .m-audio-devices-col {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    max-height: calc(100dvh - 40px - var(--safe-top) - var(--safe-bottom));
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    background: var(--panel);
+    padding: 10px 12px;
+  }
+
+  .m-audio-devices-col:only-child {
+    grid-column: 1 / -1;
+  }
+
+  .m-audio-active-box {
+    flex: 1;
+    justify-content: center;
+    min-height: min(100%, 520px);
+  }
+
+  .m-audio-cover-wrap {
+    width: min(180px, 32vh, 38vw);
+  }
+
+  .m-audio-empty {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    background: var(--panel);
+  }
+
+  .m-audio-divider {
+    margin: 10px 0;
+  }
+
+  .m-audio-active-members:not(.hidden) + .m-audio-divider {
+    margin-top: 4px;
+  }
+
+  .m-audio-others {
+    grid-template-columns: 1fr;
+    flex: 1;
+    align-content: start;
+  }
+}
+
+@media (orientation: landscape) and (min-width: 720px), (min-aspect-ratio: 1/1) and (min-width: 720px) {
+  .m-audio-layout {
+    grid-template-columns: minmax(320px, 1fr) minmax(300px, 1fr);
+    gap: 18px;
+    max-width: 980px;
+    margin: 0 auto;
+  }
+
+  .m-audio-cover-wrap {
+    width: min(220px, 36vh);
+  }
+
+  .m-audio-others {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .m-audio-member-row {
+    grid-template-columns: minmax(0, 1fr) 4.5rem 2.5rem minmax(0, 1fr) 34px;
+  }
 }

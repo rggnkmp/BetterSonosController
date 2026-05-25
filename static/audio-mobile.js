@@ -343,6 +343,12 @@ function renderActive(np, devices) {
   $("m-audio-empty").classList.toggle("hidden", active || devices.length === 0);
   $("m-audio-active").classList.toggle("hidden", !active);
 
+  const othersPreview = devices
+    .filter((d) => !active || clusterCoordId(d) !== coordId)
+    .length;
+  const showDevicesCol = active || othersPreview > 0;
+  $("m-audio-devices")?.classList.toggle("hidden", !showDevicesCol);
+
   if (!active) return;
 
   $("m-audio-device").textContent = isGroup
