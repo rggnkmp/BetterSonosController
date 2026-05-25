@@ -20,11 +20,10 @@
     <section>
       <h2>Installation (quick guide)</h2>
       <ol class="m-audio-help-steps">
-        <li><strong>Get the code</strong> — clone or download from <a href="https://github.com/rggnkmp/BetterSonosController">GitHub</a>.</li>
-        <li><strong>Open Terminal</strong> in the project folder and run:<br><code>./local-scripts/setup.sh</code></li>
-        <li><strong>Start the server:</strong><br><code>./local-scripts/setup.sh --start</code></li>
-        <li><strong>Open in browser:</strong> <code>http://127.0.0.1:8766/</code> (on this computer) or <code>http://YOUR-COMPUTER-IP:8766/</code> on your phone (same Wi‑Fi).</li>
-        <li><strong>Optional:</strong> <code>./local-scripts/setup.sh --autostart</code> to run after every login (Mac).</li>
+        <li><strong>One-line install</strong> (Mac/Linux Terminal):<br><code>curl -fsSL https://raw.githubusercontent.com/rggnkmp/BetterSonosController/main/install.sh | bash</code></li>
+        <li><strong>Start the server:</strong><br><code>./install.sh --start</code><br>Or in one go: <code>…/install.sh | bash -s -- --start</code></li>
+        <li><strong>Open in browser:</strong> <code>http://127.0.0.1:8766/</code> (this computer) or <code>http://YOUR-COMPUTER-IP:8766/</code> on your phone (same Wi‑Fi).</li>
+        <li><strong>Optional auto-start (Mac):</strong> <code>./install.sh --autostart</code></li>
       </ol>
       <p>Speakers not found? Edit <code>config/sonos-mobile.env</code> and set <code>SONOS_IP</code> to your speaker addresses. Full instructions are in the project <code>README.md</code>.</p>
     </section>

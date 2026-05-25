@@ -17,7 +17,39 @@ No Home Assistant, no Homee, no extra accounts.
 
 ---
 
-## Installation (step by step)
+## Installation (easy mode)
+
+**One command** — downloads (if needed), checks dependencies, installs everything, tests Sonos:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rggnkmp/BetterSonosController/main/install.sh | bash
+```
+
+**Download, install, and start the server** (leave Terminal open):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rggnkmp/BetterSonosController/main/install.sh | bash -s -- --start
+```
+
+Already cloned the repo? From the project folder:
+
+```bash
+./install.sh              # check + install + test
+./install.sh --start      # install + run server
+./install.sh --autostart  # install + start after every login (Mac)
+```
+
+The installer automatically:
+
+- checks Python 3.10+, `venv`, and `curl`
+- makes scripts executable
+- creates `config/sonos-mobile.env` if missing
+- installs Python packages into `.venv/`
+- runs a quick test and prints your URLs
+
+---
+
+## Installation (manual)
 
 ### 1. Download the project
 
@@ -33,9 +65,10 @@ Don't have git? Download the ZIP from GitHub (**Code → Download ZIP**), unzip 
 ### 2. Run the setup script
 
 ```bash
-chmod +x local-scripts/setup.sh local-scripts/start.sh
-./local-scripts/setup.sh
+./install.sh
 ```
+
+This replaces the older `./local-scripts/setup.sh` (which still works as a shortcut).
 
 This will:
 
@@ -48,7 +81,7 @@ If you see **“Setup OK — N speakers found”**, you're good.
 ### 3. Start the server
 
 ```bash
-./local-scripts/setup.sh --start
+./install.sh --start
 ```
 
 Leave this Terminal window open while you use the controller.
@@ -82,7 +115,7 @@ http://127.0.0.1:8766/help
 So you don't have to run Terminal every time:
 
 ```bash
-./local-scripts/setup.sh --autostart
+./install.sh --autostart
 ```
 
 This copies the app to `~/sonos-mobile/` and registers a LaunchAgent. After a reboot, the server should start on its own.
@@ -116,7 +149,7 @@ Restart the server after changes.
 
 | Problem | What to try |
 |---------|-------------|
-| **Connection failed** in the browser | Server not running → `./local-scripts/setup.sh --start` |
+| **Connection failed** in the browser | Server not running → `./install.sh --start` |
 | **No speakers found** | Same Wi‑Fi? Set `SONOS_IP` in config |
 | **Phone can't connect** | Use computer IP, not `127.0.0.1`. Check firewall allows port 8766 |
 | **Port already in use** | Change `SONOS_MOBILE_PORT` in config |
