@@ -80,6 +80,80 @@ def _track_title(entry: dict[str, Any]) -> str:
     return str(entry.get("status") or "Bereit")
 
 
+def _track_richness(entry: dict[str, Any]) -> tuple[int, str]:
+    """Higher = more useful metadata for the now-playing card."""
+    title = str(entry.get("title") or "").strip()
+    artist = str(entry.get("artist") or "").strip()
+    score = 0
+    if title:
+        score += 4
+    if artist:
+        score += 2
+    if entry.get("has_cover"):
+        score += 2
+    if entry.get("duration_s"):
+        score += 1
+    return score, title.lower()
+
+
+def _best_track_entry(coord: dict[str, Any], by_id: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Coordinator controls playback; track metadata may live on a group member."""
+    best = coord
+    best_score = _track_richness(best)
+    for uid in coord.get("member_uids") or []:
+        member = by_id.get(str(uid))
+        if member is None:
+            continue
+        score = _track_richness(member)
+        if score > best_score:
+            best = member
+            best_score = score
+    return best
+
+
+def _select_active_coord_ids(speakers: list[dict[str, Any]], by_id: dict[str, dict[str, Any]]) -> list[str]:
+    clusters: dict[str, dict[str, Any]] = {}
+    for entry in speakers:
+        if not entry["active"]:
+            continue
+        coord_id = entry["coordinator_id"]
+        if coord_id not in clusters:
+            clusters[coord_id] = by_id.get(coord_id, entry)
+
+    return sorted(
+        clusters.keys(),
+        key=lambda coord_id: (
+            _track_richness(_best_track_entry(clusters[coord_id], by_id)),
+            clusters[coord_id]["name"].lower(),
+        ),
+        reverse=True,
+    )
+
+
+def _now_playing_payload(coord_id: str, by_id: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    coord = by_id[coord_id]
+    track = _best_track_entry(coord, by_id)
+    return {
+        "id": coord["id"],
+        "coordinator_id": coord_id,
+        "name": coord["name"],
+        "playing": coord["playing"],
+        "paused": coord["paused"],
+        "title": _track_title(track),
+        "artist": track.get("artist") or "",
+        "track_title": track.get("title") or "",
+        "position_s": track.get("position_s"),
+        "duration_s": track.get("duration_s"),
+        "volume": coord.get("volume"),
+        "muted": coord.get("muted"),
+        "cover_url": track.get("cover_url") or "",
+        "has_cover": bool(track.get("cover_url")),
+        "cover_device_id": track.get("id") or coord["id"],
+        "is_coordinator": coord.get("is_coordinator"),
+        "group_size": coord.get("group_size") or 1,
+    }
+
+
 def get_panel_audio() -> dict[str, Any]:
     from sonos_cache import get_unified_devices, refresh_sonos_cache
 
@@ -99,37 +173,23 @@ def get_panel_audio() -> dict[str, Any]:
 
     speakers.sort(key=lambda item: (0 if item["active"] else 1, item["name"].lower()))
 
-    active_coord_id: str | None = None
-    for entry in speakers:
-        if not entry["active"]:
-            continue
-        active_coord_id = entry["coordinator_id"]
-        break
+    active_coord_ids = _select_active_coord_ids(speakers, by_id)
 
+    sessions: list[dict[str, Any]] = []
     now_playing: dict[str, Any] | None = None
     group_members: list[dict[str, Any]] = []
     member_ids: set[str] = set()
 
-    if active_coord_id and active_coord_id in by_id:
+    for active_coord_id in active_coord_ids:
+        if active_coord_id not in by_id:
+            continue
+        payload = _now_playing_payload(active_coord_id, by_id)
+        sessions.append(payload)
+
+    if sessions:
+        now_playing = sessions[0]
+        active_coord_id = sessions[0]["coordinator_id"]
         coord = by_id[active_coord_id]
-        now_playing = {
-            "id": coord["id"],
-            "coordinator_id": active_coord_id,
-            "name": coord["name"],
-            "playing": coord["playing"],
-            "paused": coord["paused"],
-            "title": _track_title(coord),
-            "artist": coord.get("artist") or "",
-            "track_title": coord.get("title") or "",
-            "position_s": coord.get("position_s"),
-            "duration_s": coord.get("duration_s"),
-            "volume": coord.get("volume"),
-            "muted": coord.get("muted"),
-            "cover_url": coord.get("cover_url") or "",
-            "has_cover": bool(coord.get("cover_url")),
-            "is_coordinator": coord.get("is_coordinator"),
-            "group_size": coord.get("group_size") or 1,
-        }
 
         if (coord.get("group_size") or 1) > 1:
             for uid in coord.get("member_uids") or []:
@@ -152,42 +212,38 @@ def get_panel_audio() -> dict[str, Any]:
             group_members = group_members[:PANEL_GROUP_MEMBERS]
             member_ids.update(item["id"] for item in group_members)
 
+    for session in sessions:
+        coord = by_id.get(session["coordinator_id"])
+        if not coord:
+            continue
+        member_ids.add(session["coordinator_id"])
+        for uid in coord.get("member_uids") or []:
+            member_ids.add(str(uid))
+
     others: list[dict[str, Any]] = []
     for entry in speakers:
         if entry["id"] in member_ids:
-            continue
-        if entry["active"]:
             continue
         others.append({"id": entry["id"], "name": entry["name"]})
     others.sort(key=lambda item: item["name"].lower())
     others = others[:PANEL_AUDIO_OTHERS]
 
     active: dict[str, Any] | None = None
-    for entry in speakers:
-        if not entry["active"]:
-            continue
-        active = {
-            "id": entry["id"],
-            "name": entry["name"],
-            "status": _track_title(entry),
-            "playing": entry["playing"],
-        }
-        break
-    if active is None and now_playing and (now_playing.get("playing") or now_playing.get("paused")):
-        active = {
-            "id": now_playing["id"],
-            "name": now_playing["name"],
-            "status": now_playing["title"],
-            "playing": now_playing["playing"],
-        }
-    elif active is not None and now_playing:
-        active = {
-            **active,
-            "status": now_playing["title"],
-            "id": now_playing["id"],
-            "name": now_playing["name"],
-            "playing": now_playing["playing"],
-        }
+    if sessions:
+        if len(sessions) == 1:
+            active = {
+                "id": sessions[0]["id"],
+                "name": sessions[0]["name"],
+                "status": sessions[0]["title"],
+                "playing": sessions[0]["playing"],
+            }
+        else:
+            active = {
+                "id": sessions[0]["id"],
+                "name": f"{len(sessions)} Wiedergaben",
+                "status": sessions[0]["title"],
+                "playing": any(s["playing"] for s in sessions),
+            }
 
     legacy_speakers = [
         {
@@ -201,7 +257,10 @@ def get_panel_audio() -> dict[str, Any]:
 
     summary = ""
     if active:
-        summary = f"▶ {active['name']}: {active['status']}"
+        if len(sessions) > 1:
+            summary = f"▶ {len(sessions)} Wiedergaben aktiv"
+        else:
+            summary = f"▶ {active['name']}: {active['status']}"
 
     return {
         "updated_at": time.time(),
@@ -209,6 +268,7 @@ def get_panel_audio() -> dict[str, Any]:
         "summary": summary,
         "active": active,
         "now_playing": now_playing,
+        "sessions": sessions,
         "group_members": group_members,
         "others": others,
         "speakers": legacy_speakers,

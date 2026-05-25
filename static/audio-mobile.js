@@ -26,11 +26,11 @@ const ICONS = {
 const state = {
   panel: null,
   devices: [],
-  scrubbing: false,
+  scrubCoordId: null,
   pollInFlight: false,
-  playbackClock: null,
+  playbackClocks: {},
+  coverKeys: {},
   drag: null,
-  coverKey: "",
   dropBound: false,
 };
 
@@ -57,7 +57,7 @@ function fmtTime(seconds) {
 }
 
 function deviceKey(d) {
-  return `${d.source}:${d.device_id}`;
+  return `${d.source || "sonos"}:${d.device_id}`;
 }
 
 function parseKey(key) {
@@ -74,14 +74,8 @@ function clusterCoordId(device) {
   return g.coordinator_uid || device.device_id;
 }
 
-function nowPlaying() {
-  return state.panel?.now_playing || null;
-}
-
-function activeCoordId() {
-  const np = nowPlaying();
-  if (!np) return null;
-  return np.coordinator_id || np.id || null;
+function isDeviceActive(device) {
+  return Boolean(device?.is_playing) || device?.transport_state === "PAUSED_PLAYBACK";
 }
 
 function clusterMembers(devices, coordId) {
@@ -94,6 +88,99 @@ function sortMembers(members, coordinator) {
     if (b.device_id === coordinator.device_id) return 1;
     return (a.name || "").localeCompare(b.name || "", "de");
   });
+}
+
+function buildClusters(devices) {
+  const clusters = new Map();
+  for (const device of devices) {
+    const coordId = clusterCoordId(device);
+    if (!clusters.has(coordId)) clusters.set(coordId, []);
+    clusters.get(coordId).push(device);
+  }
+  const grouped = [];
+  const solo = [];
+  for (const [, members] of clusters) {
+    if (members.length > 1) grouped.push(members);
+    else solo.push(members[0]);
+  }
+  grouped.sort((a, b) => (a[0]?.name || "").localeCompare(b[0]?.name || "", "de"));
+  solo.sort((a, b) => (a.name || "").localeCompare(b.name || "", "de"));
+  return { grouped, solo };
+}
+
+function trackRichness(device) {
+  const track = device?.track || {};
+  let score = 0;
+  if (track.title) score += 4;
+  if (track.artist) score += 2;
+  if (track.album_art) score += 2;
+  if (track.duration_s) score += 1;
+  return score;
+}
+
+function bestTrackDevice(members) {
+  return members.reduce((best, member) => (trackRichness(member) > trackRichness(best) ? member : best), members[0]);
+}
+
+function trackLabel(device) {
+  const track = device?.track || {};
+  if (isDeviceActive(device) && track.title && track.artist) return `${track.artist} – ${track.title}`;
+  if (isDeviceActive(device) && track.title) return track.title;
+  if (device?.transport_state === "PAUSED_PLAYBACK") return "Pausiert";
+  if (device?.is_playing) return "Wiedergabe";
+  return "Bereit";
+}
+
+function sessionPayload(coordinator, members) {
+  const trackDevice = bestTrackDevice(members);
+  const track = trackDevice?.track || {};
+  const coordId = clusterCoordId(coordinator);
+  return {
+    id: coordinator.device_id,
+    coordinator_id: coordId,
+    name: coordinator.name || "Sonos",
+    playing: Boolean(coordinator.is_playing),
+    paused: coordinator.transport_state === "PAUSED_PLAYBACK",
+    title: trackLabel(trackDevice),
+    artist: track.artist || "",
+    track_title: track.title || "",
+    position_s: track.position_s,
+    duration_s: track.duration_s,
+    volume: coordinator.volume,
+    muted: Boolean(coordinator.muted),
+    cover_url: track.album_art || "",
+    has_cover: Boolean(track.album_art),
+    cover_device_id: trackDevice.device_id,
+    group_size: members.length,
+  };
+}
+
+function activeSessions(devices) {
+  const { grouped, solo } = buildClusters(devices);
+  const sessions = [];
+
+  for (const members of grouped) {
+    if (!members.some(isDeviceActive)) continue;
+    const coordinator = members.find((m) => groupInfo(m).is_coordinator) || members[0];
+    sessions.push({ coordinator, members, np: sessionPayload(coordinator, members) });
+  }
+
+  for (const device of solo) {
+    if (!isDeviceActive(device)) continue;
+    sessions.push({ coordinator: device, members: [device], np: sessionPayload(device, [device]) });
+  }
+
+  sessions.sort((a, b) => {
+    const diff = trackRichness(bestTrackDevice(b.members)) - trackRichness(bestTrackDevice(a.members));
+    if (diff !== 0) return diff;
+    return (a.coordinator.name || "").localeCompare(b.coordinator.name || "", "de");
+  });
+
+  return sessions;
+}
+
+function activeCoordIds(sessions) {
+  return new Set(sessions.map((s) => s.np.coordinator_id));
 }
 
 async function sonosAction(deviceId, action, payload = null) {
@@ -123,20 +210,86 @@ function patchDevice(deviceId, patch) {
   if (row) Object.assign(row, patch);
 }
 
-function patchNowPlaying(patch) {
-  if (state.panel?.now_playing) Object.assign(state.panel.now_playing, patch);
+function cloneGroup(device) {
+  const g = groupInfo(device);
+  return {
+    coordinator_uid: g.coordinator_uid || device.device_id,
+    is_coordinator: Boolean(g.is_coordinator),
+    member_uids: [...(g.member_uids || [])],
+    member_names: [...(g.member_names || [])],
+  };
+}
+
+function optimisticUnjoin(deviceId) {
+  const device = state.devices.find((d) => d.device_id === deviceId);
+  if (!device) return null;
+
+  const snapshot = state.devices.map((d) => ({
+    device_id: d.device_id,
+    group: cloneGroup(d),
+  }));
+
+  const coordId = clusterCoordId(device);
+  const members = clusterMembers(state.devices, coordId);
+  const remaining = members.filter((m) => m.device_id !== deviceId);
+
+  patchDevice(deviceId, {
+    group: {
+      coordinator_uid: deviceId,
+      is_coordinator: true,
+      member_uids: [deviceId],
+      member_names: [device.name || ""],
+    },
+  });
+
+  if (remaining.length <= 1) {
+    for (const m of remaining) {
+      patchDevice(m.device_id, {
+        group: {
+          coordinator_uid: m.device_id,
+          is_coordinator: true,
+          member_uids: [m.device_id],
+          member_names: [m.name || ""],
+        },
+      });
+    }
+  } else {
+    const memberUids = remaining.map((m) => m.device_id);
+    const memberNames = remaining.map((m) => m.name || "");
+    for (const m of remaining) {
+      patchDevice(m.device_id, {
+        group: {
+          coordinator_uid: coordId,
+          is_coordinator: m.device_id === coordId,
+          member_uids: memberUids,
+          member_names: memberNames,
+        },
+      });
+    }
+  }
+
+  if (state.panel) render(state.panel, state.devices);
+  return snapshot;
+}
+
+function rollbackUnjoin(snapshot) {
+  if (!snapshot) return;
+  for (const item of snapshot) {
+    patchDevice(item.device_id, { group: item.group });
+  }
+  if (state.panel) render(state.panel, state.devices);
+}
+
+function leaveGroup(deviceId) {
+  const snapshot = optimisticUnjoin(deviceId);
+  return runAction(() => sonosAction(deviceId, "unjoin"), {
+    onError: () => rollbackUnjoin(snapshot),
+  });
 }
 
 function setMuteButton(btn, muted) {
   btn.innerHTML = muted ? ICONS.mute : ICONS.unmute;
   btn.setAttribute("aria-label", muted ? "Stumm aus" : "Stumm");
-}
-
-function setPlayButton(playing) {
-  $("m-audio-toggle").innerHTML = playing ? ICONS.pause : ICONS.play;
-  $("m-audio-toggle").setAttribute("aria-label", playing ? "Pause" : "Wiedergabe");
-  patchNowPlaying({ playing, paused: !playing });
-  if (!playing) state.playbackClock = null;
 }
 
 function showError(msg) {
@@ -150,53 +303,89 @@ function showError(msg) {
   el.classList.remove("hidden");
 }
 
-function syncClock(np) {
-  if (!np?.playing || np.position_s == null || np.duration_s == null || np.duration_s <= 0) {
-    state.playbackClock = null;
-    return;
-  }
-  state.playbackClock = { position: np.position_s, duration: np.duration_s, syncedAt: Date.now() };
+function sessionCoverKey(np) {
+  const id = np?.cover_device_id || np?.coordinator_id || np?.id;
+  const trackTag = [
+    np?.track_title || "",
+    np?.artist || "",
+    (np?.cover_url || "").trim(),
+  ].join("\0");
+  return `${id}:${trackTag}`;
 }
 
-function currentPosition() {
-  const np = nowPlaying();
-  if (state.scrubbing) return Number($("m-audio-scrub").value);
-  if (state.playbackClock && np?.playing) {
-    const elapsed = (Date.now() - state.playbackClock.syncedAt) / 1000;
-    return Math.min(state.playbackClock.position + elapsed, state.playbackClock.duration);
+function coverImageSrc(np) {
+  const id = np?.cover_device_id || np?.coordinator_id || np?.id;
+  const directUrl = (np?.cover_url || "").trim();
+  if (!id) return directUrl;
+  const bust = encodeURIComponent([np?.track_title || "", np?.artist || ""].join(" – ") || "track");
+  return `/api/panel/audio/cover?device_id=${encodeURIComponent(id)}&t=${bust}`;
+}
+
+function membersFingerprint(members) {
+  return members
+    .map((m) => m.device_id)
+    .sort()
+    .join(",");
+}
+
+function syncSessionClock(np, coordId) {
+  if (np?.playing && np.position_s != null && np.duration_s != null && np.duration_s > 0) {
+    state.playbackClocks[coordId] = {
+      position: np.position_s,
+      duration: np.duration_s,
+      syncedAt: Date.now(),
+    };
+  } else {
+    delete state.playbackClocks[coordId];
+  }
+}
+
+function sessionPosition(np, coordId, scrubEl) {
+  if (state.scrubCoordId === coordId && scrubEl) return Number(scrubEl.value);
+  const clock = state.playbackClocks[coordId];
+  if (clock && np?.playing) {
+    const elapsed = (Date.now() - clock.syncedAt) / 1000;
+    return Math.min(clock.position + elapsed, clock.duration);
   }
   return np?.position_s ?? 0;
 }
 
 function tickPlayback() {
-  if (state.scrubbing) return;
-  const np = nowPlaying();
-  if (!np?.playing) return;
-  const pos = currentPosition();
-  $("m-audio-scrub").value = String(Math.floor(pos));
-  $("m-audio-pos").textContent = fmtTime(pos);
+  if (state.scrubCoordId) return;
+  for (const sessionEl of document.querySelectorAll(".m-audio-session")) {
+    const coordId = sessionEl.dataset.coordinatorId;
+    const clock = state.playbackClocks[coordId];
+    if (!clock) continue;
+    const scrub = sessionEl.querySelector(".m-audio-scrub");
+    const posEl = sessionEl.querySelector(".m-audio-pos");
+    if (!scrub || !posEl) continue;
+    const elapsed = (Date.now() - clock.syncedAt) / 1000;
+    const pos = Math.min(clock.position + elapsed, clock.duration);
+    scrub.value = String(Math.floor(pos));
+    posEl.textContent = fmtTime(pos);
+  }
 }
 
-function setCover(np) {
-  const cover = $("m-audio-cover");
-  const ph = $("m-audio-cover-ph");
-  const id = np?.coordinator_id || np?.id;
+function setCoverOn(np, cover, ph, coordId) {
+  const key = sessionCoverKey(np);
   const directUrl = (np?.cover_url || "").trim();
-  const hasCover = Boolean(np?.has_cover && (directUrl || id));
+  const id = np?.cover_device_id || np?.coordinator_id || np?.id;
+  const hasCover = Boolean(directUrl || np?.has_cover || id);
+  const nextSrc = hasCover ? coverImageSrc(np) || directUrl : "";
 
-  if (!hasCover) {
-    state.coverKey = "";
+  if (!hasCover || !nextSrc) {
+    delete state.coverKeys[coordId];
     cover.classList.remove("is-loaded");
     cover.removeAttribute("src");
     ph.classList.remove("hidden");
     return;
   }
 
-  const key = `${id}:${directUrl}`;
-  if (key === state.coverKey && cover.classList.contains("is-loaded")) return;
+  if (key === state.coverKeys[coordId] && cover.classList.contains("is-loaded") && cover.getAttribute("src") === nextSrc) {
+    return;
+  }
 
-  state.coverKey = key;
-  cover.classList.remove("is-loaded");
+  state.coverKeys[coordId] = key;
   cover.alt = np.track_title || np.title || "Cover";
 
   const show = () => {
@@ -219,10 +408,8 @@ function setCover(np) {
   };
 
   delete cover.dataset.fallback;
-  cover.src = id
-    ? `/api/panel/audio/cover?device_id=${encodeURIComponent(id)}`
-    : directUrl;
-
+  cover.classList.remove("is-loaded");
+  cover.src = nextSrc;
   if (cover.complete && cover.naturalWidth > 0) show();
 }
 
@@ -241,6 +428,8 @@ function activeMemberRow(member, coordinator) {
   li.className = "m-audio-member-row";
   li.dataset.deviceKey = deviceKey(member);
 
+  li.appendChild(createDragHandle(deviceKey(member), member.name));
+
   const name = document.createElement("span");
   name.className = "m-audio-member-name";
   name.textContent = member.name + (member.device_id === coordinator.device_id ? " ★" : "");
@@ -255,9 +444,7 @@ function activeMemberRow(member, coordinator) {
   vol.max = "100";
   vol.value = String(member.volume ?? 0);
   vol.setAttribute("aria-label", `Lautstärke ${member.name}`);
-  vol.addEventListener("input", () => {
-    patchDevice(member.device_id, { volume: Number(vol.value) });
-  });
+  vol.addEventListener("input", () => patchDevice(member.device_id, { volume: Number(vol.value) }));
   vol.addEventListener("change", () => {
     const value = Number(vol.value);
     const prev = member.volume ?? 0;
@@ -273,58 +460,59 @@ function activeMemberRow(member, coordinator) {
   li.appendChild(volWrap);
 
   let muted = Boolean(member.muted);
-  const mute = iconBtn(
-    muted ? ICONS.mute : ICONS.unmute,
-    muted ? "Stumm aus" : "Stumm",
-    () => {
-      const prev = muted;
-      muted = !muted;
-      setMuteButton(mute, muted);
-      patchDevice(member.device_id, { muted });
-      runAction(() => sonosAction(member.device_id, "set", { mute: muted }), {
-        onError: () => {
-          muted = prev;
-          setMuteButton(mute, muted);
-          patchDevice(member.device_id, { muted: prev });
-        },
-      });
-    }
-  );
+  const mute = iconBtn(muted ? ICONS.mute : ICONS.unmute, muted ? "Stumm aus" : "Stumm", () => {
+    const prev = muted;
+    muted = !muted;
+    setMuteButton(mute, muted);
+    patchDevice(member.device_id, { muted });
+    runAction(() => sonosAction(member.device_id, "set", { mute: muted }), {
+      onError: () => {
+        muted = prev;
+        setMuteButton(mute, muted);
+        patchDevice(member.device_id, { muted: prev });
+      },
+    });
+  });
   li.appendChild(mute);
 
   const actions = document.createElement("div");
   actions.className = "m-audio-member-actions";
-
   if (member.device_id !== coordinator.device_id) {
     actions.appendChild(
-      iconBtn(ICONS.star, "Koordinator machen", () =>
-        runAction(() =>
-          sonosAction(coordinator.device_id, "promote_coordinator", {
-            coordinator_uid: member.device_id,
-          })
-        )
+      iconBtn(
+        ICONS.star,
+        "Koordinator machen",
+        () =>
+          runAction(() =>
+            sonosAction(coordinator.device_id, "promote_coordinator", {
+              coordinator_uid: member.device_id,
+            })
+          ),
+        { className: "m-audio-icon-btn m-audio-promote-btn" }
       )
     );
     actions.appendChild(
-      iconBtn(ICONS.leave, "Gruppe verlassen", () =>
-        runAction(() => sonosAction(member.device_id, "unjoin")),
-        { danger: true }
-      )
+      iconBtn(ICONS.leave, "Gruppe verlassen", () => leaveGroup(member.device_id), {
+        danger: true,
+        className: "m-audio-icon-btn m-audio-leave-btn",
+      })
     );
   }
   li.appendChild(actions);
 
-  const takeover = iconBtn(ICONS.takeover, "Gruppe entlassen", () =>
-    runAction(() => sonosAction(member.device_id, "takeover_group")),
-    { danger: true, className: "m-audio-icon-btn m-audio-takeover-btn" }
+  li.appendChild(
+    iconBtn(ICONS.takeover, "Gruppe entlassen", () => runAction(() => sonosAction(member.device_id, "takeover_group")), {
+      danger: true,
+      className: "m-audio-icon-btn m-audio-takeover-btn",
+    })
   );
-  li.appendChild(takeover);
   return li;
 }
 
 function otherRow(device) {
   const row = document.createElement("div");
   row.className = "m-audio-other-row";
+  row.dataset.deviceKey = deviceKey(device);
   row.appendChild(createDragHandle(deviceKey(device), device.name));
   const name = document.createElement("span");
   name.className = "m-audio-other-name";
@@ -333,91 +521,387 @@ function otherRow(device) {
   return row;
 }
 
-function renderActive(np, devices) {
-  const coordId = activeCoordId();
-  const active = Boolean(np && (np.playing || np.paused) && coordId);
-  const members = active ? clusterMembers(devices, coordId) : [];
-  const coordinator = members.find((m) => groupInfo(m).is_coordinator) || members[0];
+function createSessionBlock({ coordinator, members, np }) {
+  const coordId = np.coordinator_id;
   const isGroup = members.length > 1;
 
-  $("m-audio-empty").classList.toggle("hidden", active || devices.length === 0);
-  $("m-audio-active").classList.toggle("hidden", !active);
+  const section = document.createElement("section");
+  section.className = "m-audio-session";
+  section.dataset.coordinatorId = coordId;
+  section.dataset.coverKey = sessionCoverKey(np);
 
-  const othersPreview = devices
-    .filter((d) => !active || clusterCoordId(d) !== coordId)
-    .length;
-  const showDevicesCol = active || othersPreview > 0;
-  $("m-audio-devices")?.classList.toggle("hidden", !showDevicesCol);
+  const box = document.createElement("div");
+  box.className = "m-audio-active-box";
 
-  if (!active) return;
+  const coverWrap = document.createElement("div");
+  coverWrap.className = "m-audio-cover-wrap";
+  const cover = document.createElement("img");
+  cover.className = "m-audio-cover";
+  cover.alt = "";
+  cover.decoding = "async";
+  const coverPh = document.createElement("div");
+  coverPh.className = "m-audio-cover m-audio-cover-ph";
+  coverPh.textContent = "♪";
+  coverWrap.appendChild(cover);
+  coverWrap.appendChild(coverPh);
+  box.appendChild(coverWrap);
 
-  $("m-audio-device").textContent = isGroup
-    ? `Gruppe · ${members.length} Lautsprecher`
-    : np.name || "Sonos";
-  $("m-audio-title").textContent = np.track_title || np.title || "Unbekannt";
-  $("m-audio-artist").textContent = np.artist || "";
-  $("m-audio-artist").classList.toggle("hidden", !np.artist);
-  setCover(np);
+  const deviceLabel = document.createElement("p");
+  deviceLabel.className = "m-audio-device";
+  deviceLabel.textContent = isGroup ? `Gruppe · ${members.length} Lautsprecher` : np.name;
+  box.appendChild(deviceLabel);
 
-  const dur = np.duration_s ?? 0;
-  $("m-audio-scrub").max = String(Math.max(0, Math.floor(dur)));
-  $("m-audio-scrub").value = String(Math.floor(currentPosition()));
-  $("m-audio-pos").textContent = fmtTime(currentPosition());
-  $("m-audio-dur").textContent = fmtTime(dur);
+  const title = document.createElement("h2");
+  title.className = "m-audio-title";
+  title.textContent = np.track_title || np.title || "Unbekannt";
+  box.appendChild(title);
 
-  $("m-audio-toggle").innerHTML = np.playing ? ICONS.pause : ICONS.play;
-  $("m-audio-toggle").setAttribute("aria-label", np.playing ? "Pause" : "Wiedergabe");
+  const artist = document.createElement("p");
+  artist.className = "m-audio-artist";
+  artist.textContent = np.artist || "";
+  artist.classList.toggle("hidden", !np.artist);
+  box.appendChild(artist);
 
-  $("m-audio-solo-vol").classList.toggle("hidden", isGroup);
+  setCoverOn(np, cover, coverPh, coordId);
+
+  const timeline = document.createElement("div");
+  timeline.className = "m-audio-timeline";
+  const scrub = document.createElement("input");
+  scrub.type = "range";
+  scrub.className = "m-audio-scrub";
+  scrub.min = "0";
+  scrub.max = String(Math.max(0, Math.floor(np.duration_s ?? 0)));
+  scrub.value = String(Math.floor(sessionPosition(np, coordId)));
+  scrub.setAttribute("aria-label", "Wiedergabeposition");
+  scrub.addEventListener("pointerdown", () => {
+    state.scrubCoordId = coordId;
+  });
+  scrub.addEventListener("input", () => {
+    const posEl = section.querySelector(".m-audio-pos");
+    if (posEl) posEl.textContent = fmtTime(Number(scrub.value));
+  });
+  scrub.addEventListener("pointerup", () => {
+    state.scrubCoordId = null;
+    const pos = Number(scrub.value);
+    const prev = np.position_s ?? 0;
+    runAction(() => sonosAction(np.id, "seek", { position: pos }), {
+      onError: () => {
+        scrub.value = String(Math.floor(prev));
+        const posEl = section.querySelector(".m-audio-pos");
+        if (posEl) posEl.textContent = fmtTime(prev);
+      },
+    });
+  });
+  const times = document.createElement("div");
+  times.className = "m-audio-times";
+  const posEl = document.createElement("span");
+  posEl.className = "m-audio-pos";
+  posEl.textContent = fmtTime(sessionPosition(np, coordId));
+  const durEl = document.createElement("span");
+  durEl.className = "m-audio-dur";
+  durEl.textContent = fmtTime(np.duration_s ?? 0);
+  times.appendChild(posEl);
+  times.appendChild(durEl);
+  timeline.appendChild(scrub);
+  timeline.appendChild(times);
+  box.appendChild(timeline);
+
+  const transport = document.createElement("div");
+  transport.className = "m-audio-transport";
+  transport.appendChild(
+    iconBtn(ICONS.prev, "Zurück", () => runAction(() => sonosAction(np.id, "previous")), {
+      className: "m-audio-transport-btn",
+    })
+  );
+  const toggle = iconBtn(np.playing ? ICONS.pause : ICONS.play, np.playing ? "Pause" : "Wiedergabe", () => {
+    const wasPlaying = Boolean(np.playing);
+    toggle.innerHTML = wasPlaying ? ICONS.play : ICONS.pause;
+    toggle.setAttribute("aria-label", wasPlaying ? "Wiedergabe" : "Pause");
+    runAction(() => sonosAction(np.id, "toggle"), {
+      onError: () => {
+        toggle.innerHTML = wasPlaying ? ICONS.pause : ICONS.play;
+        toggle.setAttribute("aria-label", wasPlaying ? "Pause" : "Wiedergabe");
+      },
+    });
+  }, { className: "m-audio-transport-btn m-audio-play" });
+  transport.appendChild(toggle);
+  transport.appendChild(
+    iconBtn(ICONS.next, "Weiter", () => runAction(() => sonosAction(np.id, "next")), {
+      className: "m-audio-transport-btn",
+    })
+  );
+  box.appendChild(transport);
+
   if (!isGroup) {
-    $("m-audio-vol").value = String(np.volume ?? 0);
-    $("m-audio-vol-label").textContent = `${np.volume ?? 0}%`;
-    $("m-audio-mute").innerHTML = np.muted ? ICONS.mute : ICONS.unmute;
-    $("m-audio-mute").setAttribute("aria-label", np.muted ? "Stumm aus" : "Stumm");
+    const soloVol = document.createElement("div");
+    soloVol.className = "m-audio-volume";
+    let muted = Boolean(np.muted);
+    const muteBtn = iconBtn(muted ? ICONS.mute : ICONS.unmute, muted ? "Stumm aus" : "Stumm", () => {
+      const prev = muted;
+      muted = !muted;
+      setMuteButton(muteBtn, muted);
+      runAction(() => sonosAction(np.id, "set", { mute: muted }), {
+        onError: () => {
+          muted = prev;
+          setMuteButton(muteBtn, muted);
+        },
+      });
+    });
+    soloVol.appendChild(muteBtn);
+    const vol = document.createElement("input");
+    vol.type = "range";
+    vol.min = "0";
+    vol.max = "100";
+    vol.value = String(np.volume ?? 0);
+    vol.setAttribute("aria-label", "Lautstärke");
+    const volLabel = document.createElement("span");
+    volLabel.className = "m-audio-vol-label";
+    volLabel.textContent = `${np.volume ?? 0}%`;
+    vol.addEventListener("input", () => {
+      volLabel.textContent = `${vol.value}%`;
+    });
+    vol.addEventListener("change", () => {
+      const value = Number(vol.value);
+      const prev = np.volume ?? 0;
+      runAction(() => sonosAction(np.id, "set", { volume: value }), {
+        onError: () => {
+          vol.value = String(prev);
+          volLabel.textContent = `${prev}%`;
+        },
+      });
+    });
+    soloVol.appendChild(vol);
+    soloVol.appendChild(volLabel);
+    box.appendChild(soloVol);
   }
 
-  const membersEl = $("m-audio-active-members");
-  membersEl.innerHTML = "";
-  membersEl.classList.toggle("hidden", !isGroup);
+  section.appendChild(box);
 
-  if (isGroup && coordinator) {
-    for (const m of sortMembers(members, coordinator)) {
-      membersEl.appendChild(activeMemberRow(m, coordinator));
+  if (isGroup) {
+    const membersEl = document.createElement("ul");
+    membersEl.className = "m-audio-active-members";
+    membersEl.dataset.sessionId = coordId;
+    section.dataset.membersFp = membersFingerprint(members);
+    for (const member of sortMembers(members, coordinator)) {
+      membersEl.appendChild(activeMemberRow(member, coordinator));
+    }
+    section.appendChild(membersEl);
+  }
+
+  setupDropZone(section, async (key) => {
+    const [, deviceId] = parseKey(key);
+    if (!coordId || deviceId === coordId) return;
+    const alreadyMember = members.some((m) => m.device_id === deviceId);
+    if (alreadyMember) return;
+    await runAction(() => sonosAction(deviceId, "join", { coordinator_uid: coordId }));
+  });
+
+  syncSessionClock(np, coordId);
+  return section;
+}
+
+function updateSessionBlock(section, { coordinator, members, np }) {
+  const coordId = np.coordinator_id;
+  const isGroup = members.length > 1;
+
+  section.querySelector(".m-audio-device").textContent = isGroup
+    ? `Gruppe · ${members.length} Lautsprecher`
+    : np.name;
+  section.querySelector(".m-audio-title").textContent = np.track_title || np.title || "Unbekannt";
+
+  const artist = section.querySelector(".m-audio-artist");
+  artist.textContent = np.artist || "";
+  artist.classList.toggle("hidden", !np.artist);
+
+  const coverKey = sessionCoverKey(np);
+  if (section.dataset.coverKey !== coverKey) {
+    section.dataset.coverKey = coverKey;
+    setCoverOn(np, section.querySelector("img.m-audio-cover"), section.querySelector(".m-audio-cover-ph"), coordId);
+  }
+
+  const scrub = section.querySelector(".m-audio-scrub");
+  if (scrub && state.scrubCoordId !== coordId) {
+    scrub.max = String(Math.max(0, Math.floor(np.duration_s ?? 0)));
+    scrub.value = String(Math.floor(sessionPosition(np, coordId, scrub)));
+  }
+  if (state.scrubCoordId !== coordId) {
+    const posEl = section.querySelector(".m-audio-pos");
+    if (posEl) posEl.textContent = fmtTime(sessionPosition(np, coordId, scrub));
+  }
+  const durEl = section.querySelector(".m-audio-dur");
+  if (durEl) durEl.textContent = fmtTime(np.duration_s ?? 0);
+
+  const toggle = section.querySelector(".m-audio-play");
+  if (toggle) {
+    toggle.innerHTML = np.playing ? ICONS.pause : ICONS.play;
+    toggle.setAttribute("aria-label", np.playing ? "Pause" : "Wiedergabe");
+  }
+
+  const soloVol = section.querySelector(".m-audio-volume");
+  if (soloVol) {
+    const vol = soloVol.querySelector('input[type="range"]');
+    const volLabel = soloVol.querySelector(".m-audio-vol-label");
+    const muteBtn = soloVol.querySelector(".m-audio-icon-btn");
+    if (vol && document.activeElement !== vol) vol.value = String(np.volume ?? 0);
+    if (volLabel) volLabel.textContent = `${np.volume ?? 0}%`;
+    if (muteBtn) setMuteButton(muteBtn, Boolean(np.muted));
+  }
+
+  let membersEl = findSessionMembers(section, $("m-audio-groups"));
+  const memberFp = membersFingerprint(members);
+  if (isGroup) {
+    if (!membersEl) {
+      membersEl = document.createElement("ul");
+      membersEl.className = "m-audio-active-members";
+      membersEl.dataset.sessionId = coordId;
+      const box = section.querySelector(".m-audio-active-box");
+      if (box) box.after(membersEl);
+      else section.appendChild(membersEl);
+    }
+    if (section.dataset.membersFp !== memberFp) {
+      section.dataset.membersFp = memberFp;
+      membersEl.innerHTML = "";
+      for (const member of sortMembers(members, coordinator)) {
+        membersEl.appendChild(activeMemberRow(member, coordinator));
+      }
+    }
+  } else if (membersEl) {
+    membersEl.remove();
+    delete section.dataset.membersFp;
+  }
+
+  syncSessionClock(np, coordId);
+}
+
+function isLandscapeLayout() {
+  return window.matchMedia("(min-aspect-ratio: 1/1)").matches;
+}
+
+function findSessionMembers(section, groupsEl) {
+  const coordId = section.dataset.coordinatorId;
+  return (
+    section.querySelector(".m-audio-active-members") ||
+    groupsEl?.querySelector(`.m-audio-active-members[data-session-id="${coordId}"]`) ||
+    null
+  );
+}
+
+function syncMembersPlacement() {
+  const groupsEl = $("m-audio-groups");
+  const sessionsEl = $("m-audio-sessions");
+  if (!groupsEl || !sessionsEl) return;
+
+  const landscape = isLandscapeLayout();
+  const sections = [...sessionsEl.querySelectorAll(".m-audio-session")];
+  const activeIds = new Set(sections.map((s) => s.dataset.coordinatorId));
+
+  for (const el of [...groupsEl.querySelectorAll(".m-audio-active-members")]) {
+    if (!activeIds.has(el.dataset.sessionId)) el.remove();
+  }
+
+  if (landscape) {
+    for (const section of sections) {
+      const membersEl = findSessionMembers(section, groupsEl);
+      if (membersEl && membersEl.parentElement !== groupsEl) groupsEl.appendChild(membersEl);
+    }
+    return;
+  }
+
+  for (const section of sections) {
+    const membersEl = findSessionMembers(section, groupsEl);
+    if (!membersEl) continue;
+    const box = section.querySelector(".m-audio-active-box");
+    if (box && membersEl.parentElement !== section) box.after(membersEl);
+  }
+}
+
+function renderSessions(devices) {
+  const sessions = activeSessions(devices);
+  const sessionsEl = $("m-audio-sessions");
+  const existing = new Map(
+    [...sessionsEl.querySelectorAll(".m-audio-session")].map((el) => [el.dataset.coordinatorId, el])
+  );
+  const nextIds = new Set();
+
+  $("m-audio-empty").classList.toggle("hidden", sessions.length > 0 || devices.length === 0);
+
+  for (const session of sessions) {
+    const coordId = session.np.coordinator_id;
+    nextIds.add(coordId);
+    let el = existing.get(coordId);
+    if (el) updateSessionBlock(el, session);
+    else el = createSessionBlock(session);
+    sessionsEl.appendChild(el);
+  }
+
+  for (const [coordId, el] of existing) {
+    if (!nextIds.has(coordId)) {
+      el.remove();
+      delete state.coverKeys[coordId];
+      delete state.playbackClocks[coordId];
     }
   }
 
-  setupDropZone($("m-audio-active"), async (key) => {
-    const [, deviceId] = parseKey(key);
-    if (deviceId === coordId) return;
-    await sonosAction(deviceId, "join", { coordinator_uid: coordId });
-  });
+  syncMembersPlacement();
 
-  syncClock(np);
+  return sessions;
 }
 
-function renderOthers(devices) {
-  const coordId = activeCoordId();
-  const np = nowPlaying();
-  const active = Boolean(np && (np.playing || np.paused) && coordId);
+function renderOthers(devices, sessions) {
+  const busyIds = new Set();
+  for (const session of sessions) {
+    for (const member of session.members) busyIds.add(member.device_id);
+  }
 
   const others = devices
-    .filter((d) => !active || clusterCoordId(d) !== coordId)
+    .filter((d) => !busyIds.has(d.device_id))
     .sort((a, b) => (a.name || "").localeCompare(b.name || "", "de"));
 
   const othersEl = $("m-audio-others");
-  othersEl.innerHTML = "";
-  othersEl.classList.toggle("hidden", others.length === 0);
-  $("m-audio-divider").classList.toggle("hidden", !active || others.length === 0);
+  const showOthers = others.length > 0;
+  othersEl.classList.toggle("hidden", !showOthers);
+  $("m-audio-idle-divider")?.classList.toggle("hidden", !showOthers);
 
-  for (const d of others) othersEl.appendChild(otherRow(d));
+  const showDevicesCol = sessions.length > 0 || showOthers;
+  $("m-audio-devices")?.classList.toggle("hidden", !showDevicesCol);
+
+  const existing = new Map(
+    [...othersEl.querySelectorAll(".m-audio-other-row")].map((el) => [el.dataset.deviceKey, el])
+  );
+  const nextKeys = new Set();
+
+  for (const d of others) {
+    const key = deviceKey(d);
+    nextKeys.add(key);
+    let row = existing.get(key);
+    if (!row) {
+      row = otherRow(d);
+      othersEl.appendChild(row);
+    } else {
+      row.querySelector(".m-audio-other-name").textContent = d.name;
+    }
+  }
+
+  for (const [key, row] of existing) {
+    if (!nextKeys.has(key)) row.remove();
+  }
 
   if (!state.dropBound) {
     setupDropZone(othersEl, async (key) => {
       const [, deviceId] = parseKey(key);
-      await sonosAction(deviceId, "unjoin");
+      await leaveGroup(deviceId);
     });
     state.dropBound = true;
   }
+}
+
+function buildSummary(sessions) {
+  if (!sessions.length) return `${state.devices.length} Lautsprecher`;
+  if (sessions.length === 1) {
+    const np = sessions[0].np;
+    return `▶ ${np.name}: ${np.track_title || np.title}`;
+  }
+  return `▶ ${sessions.length} Wiedergaben aktiv`;
 }
 
 function render(panel, devices) {
@@ -425,23 +909,20 @@ function render(panel, devices) {
   state.devices = devices;
   document.body.classList.remove("m-audio-loading");
 
-  $("m-audio-meta").textContent = panel.summary || `${devices.length} Lautsprecher`;
+  const sessions = renderSessions(devices);
+  renderOthers(devices, sessions);
+
+  $("m-audio-meta").textContent = panel.summary || buildSummary(sessions);
 
   const errors = [...(panel.errors || []), ...(devices.sonos_errors || [])].filter(Boolean);
   showError(errors.length ? errors.join(" · ") : null);
-
-  renderActive(panel.now_playing, devices);
-  renderOthers(devices);
 }
 
 async function poll(force = false) {
   if (state.pollInFlight && !force) return;
   state.pollInFlight = true;
   try {
-    const [panelRes, devRes] = await Promise.all([
-      fetch("/api/panel/audio"),
-      fetch("/api/sonos/devices"),
-    ]);
+    const [panelRes, devRes] = await Promise.all([fetch("/api/panel/audio"), fetch("/api/sonos/devices")]);
     const panel = await panelRes.json();
     const devPayload = await devRes.json();
     if (!panelRes.ok) throw new Error(panel.error || "Sonos nicht erreichbar");
@@ -460,7 +941,7 @@ function dropTargetAt(x, y) {
   if (ghost) ghost.style.pointerEvents = "none";
   const el = document.elementFromPoint(x, y);
   if (ghost) ghost.style.pointerEvents = "";
-  return el?.closest("[data-drop-bound='1']");
+  return el?.closest("[data-drop-bound='1'], [data-drop-target='1'], .m-audio-session");
 }
 
 function setupDropZone(zone, onDrop) {
@@ -479,7 +960,6 @@ function setupDropZone(zone, onDrop) {
     if (!key) return;
     try {
       await onDrop(key, zone);
-      await poll(true);
     } catch (err) {
       showError(err.message);
     }
@@ -493,6 +973,14 @@ function endPointerDrag() {
   document.removeEventListener("pointermove", d.onMove);
   document.removeEventListener("pointerup", d.onUp);
   document.removeEventListener("pointercancel", d.onUp);
+  if (d.scrollParent) d.scrollParent.style.overflow = "";
+  if (d.el?.releasePointerCapture && d.pointerId != null) {
+    try {
+      d.el.releasePointerCapture(d.pointerId);
+    } catch {
+      /* ignore */
+    }
+  }
   $("m-audio-drag-ghost").classList.add("hidden");
   document.body.classList.remove("m-audio-dragging");
   d.el.classList.remove("dragging");
@@ -509,17 +997,31 @@ function setupDraggable(el, key, label = "") {
     e.dataTransfer.setData("text/plain", key);
     e.dataTransfer.effectAllowed = "move";
     el.classList.add("dragging");
+    document.body.classList.add("m-audio-dragging");
+    const scrollParent = $("m-audio-devices");
+    if (scrollParent) scrollParent.style.overflow = "hidden";
   });
   el.addEventListener("dragend", () => {
     el.classList.remove("dragging");
+    document.body.classList.remove("m-audio-dragging");
+    const scrollParent = $("m-audio-devices");
+    if (scrollParent) scrollParent.style.overflow = "";
     if (state.drag?.html) state.drag = null;
   });
 
   el.addEventListener("pointerdown", (e) => {
     if (e.button !== 0 || state.drag) return;
     e.stopPropagation();
-    const holdTimer = setTimeout(() => {
+    const scrollParent = $("m-audio-devices");
+    let holdTimer;
+
+    const cancelHold = () => clearTimeout(holdTimer);
+
+    holdTimer = setTimeout(() => {
+      el.removeEventListener("pointerup", cancelHold);
+      el.removeEventListener("pointercancel", cancelHold);
       if (state.drag?.html) return;
+
       const ghost = $("m-audio-drag-ghost");
       ghost.textContent = label || key;
       ghost.classList.remove("hidden");
@@ -527,8 +1029,17 @@ function setupDraggable(el, key, label = "") {
       ghost.style.top = `${e.clientY}px`;
       el.classList.add("dragging");
       document.body.classList.add("m-audio-dragging");
+      if (scrollParent) scrollParent.style.overflow = "hidden";
+      if (el.setPointerCapture) {
+        try {
+          el.setPointerCapture(e.pointerId);
+        } catch {
+          /* ignore */
+        }
+      }
 
       const onMove = (ev) => {
+        ev.preventDefault();
         ghost.style.left = `${ev.clientX}px`;
         ghost.style.top = `${ev.clientY}px`;
         document.querySelectorAll(".drag-over").forEach((n) => n.classList.remove("drag-over"));
@@ -543,127 +1054,44 @@ function setupDraggable(el, key, label = "") {
         target.classList.remove("drag-over");
         try {
           await onDropForZone(target, key);
-          await poll(true);
         } catch (err) {
           showError(err.message);
         }
       };
 
-      state.drag = { key, el, holdTimer, onMove, onUp };
-      document.addEventListener("pointermove", onMove);
+      state.drag = { key, el, holdTimer, pointerId: e.pointerId, scrollParent, onMove, onUp };
+      document.addEventListener("pointermove", onMove, { passive: false });
       document.addEventListener("pointerup", onUp);
       document.addEventListener("pointercancel", onUp);
     }, DRAG_HOLD_MS);
 
-    const cancel = () => clearTimeout(holdTimer);
-    el.addEventListener("pointerup", cancel, { once: true });
-    el.addEventListener("pointercancel", cancel, { once: true });
+    el.addEventListener("pointerup", cancelHold, { once: true });
+    el.addEventListener("pointercancel", cancelHold, { once: true });
   });
 }
 
 async function onDropForZone(zone, key) {
-  const action = zone.dataset.dropAction;
-  const coordId = zone.dataset.coordinatorId || activeCoordId();
+  const coordId = zone.dataset.coordinatorId;
   const [, deviceId] = parseKey(key);
 
-  if (action === "unjoin" || zone.id === "m-audio-others") {
-    await sonosAction(deviceId, "unjoin");
+  if (zone.dataset.dropAction === "unjoin" || zone.id === "m-audio-others") {
+    await leaveGroup(deviceId);
     return;
   }
-  if (zone.id === "m-audio-active" && coordId && deviceId !== coordId) {
-    await sonosAction(deviceId, "join", { coordinator_uid: coordId });
+
+  if (coordId && deviceId !== coordId) {
+    const members = clusterMembers(state.devices, coordId);
+    if (members.some((m) => m.device_id === deviceId)) return;
+    await runAction(() => sonosAction(deviceId, "join", { coordinator_uid: coordId }));
   }
 }
 
-function bindControls() {
-  const np = () => nowPlaying();
+$("m-audio-refresh").innerHTML = ICONS.refresh;
+$("m-audio-refresh").addEventListener("click", () => poll(true));
 
-  $("m-audio-prev").innerHTML = ICONS.prev;
-  $("m-audio-next").innerHTML = ICONS.next;
-  $("m-audio-refresh").innerHTML = ICONS.refresh;
-
-  $("m-audio-refresh").addEventListener("click", () => poll(true));
-  $("m-audio-toggle").addEventListener("click", () => {
-    const n = np();
-    if (!n?.id) return;
-    const wasPlaying = Boolean(n.playing);
-    const next = !wasPlaying;
-    setPlayButton(next);
-    runAction(() => sonosAction(n.id, "toggle"), {
-      onError: () => setPlayButton(wasPlaying),
-    });
-  });
-  $("m-audio-prev").addEventListener("click", () => {
-    const id = np()?.id;
-    if (id) runAction(() => sonosAction(id, "previous"));
-  });
-  $("m-audio-next").addEventListener("click", () => {
-    const id = np()?.id;
-    if (id) runAction(() => sonosAction(id, "next"));
-  });
-  $("m-audio-mute").addEventListener("click", () => {
-    const n = np();
-    if (!n?.id) return;
-    const wasMuted = Boolean(n.muted);
-    const next = !wasMuted;
-    setMuteButton($("m-audio-mute"), next);
-    patchNowPlaying({ muted: next });
-    runAction(() => sonosAction(n.id, "set", { mute: next }), {
-      onError: () => {
-        setMuteButton($("m-audio-mute"), wasMuted);
-        patchNowPlaying({ muted: wasMuted });
-      },
-    });
-  });
-  const vol = $("m-audio-vol");
-  vol.addEventListener("input", () => {
-    $("m-audio-vol-label").textContent = `${vol.value}%`;
-    patchNowPlaying({ volume: Number(vol.value) });
-  });
-  vol.addEventListener("change", () => {
-    const id = np()?.id;
-    if (!id) return;
-    const value = Number(vol.value);
-    const prev = np()?.volume ?? 0;
-    patchNowPlaying({ volume: value });
-    runAction(() => sonosAction(id, "set", { volume: value }), {
-      onError: () => {
-        vol.value = String(prev);
-        $("m-audio-vol-label").textContent = `${prev}%`;
-        patchNowPlaying({ volume: prev });
-      },
-    });
-  });
-  const scrub = $("m-audio-scrub");
-  scrub.addEventListener("pointerdown", () => {
-    state.scrubbing = true;
-  });
-  scrub.addEventListener("input", () => {
-    const pos = Number(scrub.value);
-    $("m-audio-pos").textContent = fmtTime(pos);
-    patchNowPlaying({ position_s: pos });
-  });
-  scrub.addEventListener("pointerup", () => {
-    state.scrubbing = false;
-    const id = np()?.id;
-    if (!id) return;
-    const pos = Number(scrub.value);
-    const prev = np()?.position_s ?? 0;
-    patchNowPlaying({ position_s: pos });
-    syncClock(nowPlaying());
-    runAction(() => sonosAction(id, "seek", { position: pos }), {
-      onError: () => {
-        scrub.value = String(Math.floor(prev));
-        $("m-audio-pos").textContent = fmtTime(prev);
-        patchNowPlaying({ position_s: prev });
-        syncClock(nowPlaying());
-      },
-    });
-  });
-}
+window.addEventListener("resize", () => syncMembersPlacement());
 
 document.body.classList.add("m-audio-loading");
-bindControls();
 poll(true);
 setInterval(() => poll(), POLL_MS);
 setInterval(tickPlayback, TICK_MS);

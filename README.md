@@ -2,7 +2,18 @@
 
 A simple, touch-friendly web app to control Sonos speakers on your local network — from your phone, tablet, or computer. No Sonos account required. No cloud. Just a small server on your home network.
 
-![Mobile controller — now playing, group volume, and room picker](docs/screenshot-mobile-controller.jpg)
+<table>
+<tr>
+<td width="50%" align="center">
+<strong>Portrait</strong><br>
+<img src="docs/screenshot-portrait.jpg" alt="Sonos controller in portrait — now playing, group volume, and room picker" width="280">
+</td>
+<td width="50%" align="center">
+<strong>Landscape</strong><br>
+<img src="docs/screenshot-landscape.jpg" alt="Sonos controller in landscape — player on the left, groups and rooms on the right" width="420">
+</td>
+</tr>
+</table>
 
 **Live help page (when running):** open `/help` in the browser, e.g. `http://127.0.0.1:8766/help`
 
